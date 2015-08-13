@@ -14,9 +14,10 @@
 #include <geometry_msgs/PoseWithCovariance.h>
 #include <geometry_msgs/PoseWithCovarianceStamped.h>
 #include <geometry_msgs/TransformStamped.h>
+#include <geometry_msgs/Pose2D.h>
 #include <nav_msgs/Odometry.h>
 #include <tf/tf.h>
-#include <tf/transform_listener.h>  
+#include <tf/transform_listener.h>
 #include <tf/transform_broadcaster.h>
 #include <tf/transform_datatypes.h>
 #include <std_msgs/Bool.h>
@@ -77,6 +78,16 @@ class RosArnlNode
     std::string frame_id_bumper;
     std::string frame_id_sonar;
 
+    //Direct command velocity subscriber
+    ros::Subscriber cmdvel_sub;
+    void cmdvel_cb( const geometry_msgs::TwistConstPtr &);
+
+    ros::Time veltime;
+
+    //Relative position subscriber
+    ros::Subscriber relpos_sub;
+    void relpos_cb( const geometry_msgs::Pose2DConstPtr &);
+
     ros::Subscriber initialpose_sub;
     void initialpose_sub_cb(const geometry_msgs::PoseWithCovarianceStampedConstPtr &msg);
     
@@ -120,6 +131,13 @@ class RosArnlNode
         arnl.robot->unlock();
         if(e) ROS_WARN_NAMED("rosarnl_node", "rosarnl_node: Warning: Robot e-stop button pressed, cannot %s", s);
         return e;
+    }
+
+    void clear_direct_motion()
+    {
+      arnl.robot->lock();
+      if (arnl.robot->isDirectMotion()) arnl.robot->clearDirectMotion();
+      arnl.robot->unlock();
     }
 
 };
@@ -176,6 +194,10 @@ RosArnlNode::RosArnlNode(ros::NodeHandle nh, ArnlSystem& arnlsys)  :
   simple_goal_sub = n.subscribe("move_base_simple/goal", 1, (boost::function <void(const geometry_msgs::PoseStampedConstPtr&)>) boost::bind(&RosArnlNode::simple_goal_sub_cb, this, _1));
 
   goalname_sub = n.subscribe("goalname", 1, (boost::function <void(const std_msgs::StringConstPtr&)>) boost::bind(&RosArnlNode::goalname_sub_cb, this, _1));
+
+  cmdvel_sub = n.subscribe( "cmd_vel",1, (boost::function <void(const geometry_msgs::TwistConstPtr&)>) boost::bind(&RosArnlNode::cmdvel_cb, this, _1 ));
+
+  relpos_sub = n.subscribe( "rel_pos", 1, (boost::function <void(const geometry_msgs::Pose2DConstPtr&)>) boost::bind(&RosArnlNode::relpos_cb, this, _1 ));
 
   current_goal_pub = n.advertise<geometry_msgs::Pose>("current_goal", 1, true);
   arnl.pathTask->addNewGoalCB(new ArFunctor1C<RosArnlNode, ArPose>(this, &RosArnlNode::arnl_new_goal_cb));
@@ -238,7 +260,6 @@ void RosArnlNode::publish()
 
 
   // publishing transform map->base_link
-  map_trans.header.stamp = ros::Time::now();
   map_trans.header.frame_id = frame_id_map;
   map_trans.child_frame_id = frame_id_base_link;
   
@@ -247,6 +268,7 @@ void RosArnlNode::publish()
   map_trans.transform.translation.z = 0.0;
   map_trans.transform.rotation = tf::createQuaternionMsgFromYaw(pos.getTh()*M_PI/180);
 
+  map_trans.header.stamp = ros::Time::now();
   map_broadcaster.sendTransform(map_trans);
 
   
@@ -278,6 +300,14 @@ void RosArnlNode::publish()
     arnl_server_mode_pub.publish(msg);
   }
 
+  int stall = arnl.robot->getStallValue();
+  if (stall > 0)
+  {
+    ROS_INFO_NAMED("rosarnl_node", "%i",stall);
+    arnl.robot->setVel(0);
+    arnl.robot->setRotVel(0);
+    arnl.robot->clearDirectMotion();
+  }
 
   ROS_WARN_COND_NAMED((tasktime.mSecSince() > 20), "rosarnl_node", "rosarnl_node: publish aria task took %ld ms", tasktime.mSecSince());
 }
@@ -337,6 +367,35 @@ bool RosArnlNode::global_localization_srv_cb(std_srvs::Empty::Request& request, 
   return true;
 }
 
+void RosArnlNode::cmdvel_cb( const geometry_msgs::TwistConstPtr &msg)
+{
+  veltime = ros::Time::now();
+  ROS_INFO( "new speed: [%0.2f,%0.2f](%0.3f)", msg->linear.x*1e3, msg->angular.z, veltime.toSec() );
+  
+  arnl.robot->lock();
+  arnl.robot->setVel(msg->linear.x*1e3);
+  if(arnl.robot->hasLatVel())
+    arnl.robot->setLatVel(msg->linear.y*1e3);
+  arnl.robot->setRotVel(msg->angular.z*180/M_PI);
+  arnl.robot->unlock();
+  ROS_DEBUG("RosArnl: sent vels to Arnl (time %f): x vel %f mm/s, y vel %f mm/s, ang vel %f deg/s", veltime.toSec(), 
+    (double) msg->linear.x * 1e3, (double) msg->linear.y * 1e3, (double) msg->angular.z * 180/M_PI);
+}
+
+//move command does not work currently; unknown reasons
+void RosArnlNode::relpos_cb( const geometry_msgs::Pose2DConstPtr &msg)
+{
+  veltime = ros::Time::now();
+  ROS_INFO( "new movement command: %0.2f mm translation, %0.2f deg rotation (%0.3f)", msg->x*1e3, msg->theta*180/M_PI, veltime.toSec() );
+  
+  arnl.robot->lock();
+  arnl.robot->move(msg->x*1e3);
+  arnl.robot->setDeltaHeading(msg->theta*180/M_PI);
+  arnl.robot->unlock();
+  ROS_DEBUG("RosArnl: sent positions to Arnl (time %f): delta x %f mm, delta ang %f deg", veltime.toSec(), 
+    (double) msg->x * 1e3, (double) msg->theta * 180/M_PI);
+
+}
 
 void RosArnlNode::arnl_path_state_change_cb()
 {
